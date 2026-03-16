@@ -2,5 +2,5 @@ streamlit
 ultralytics
 streamlit-webrtc
 av
-opencv-python-headless
+opencv-contrib-python-headless
 numpy<2.0.0
