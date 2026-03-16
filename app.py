@@ -2,109 +2,129 @@ import streamlit as st
 import numpy as np
 from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, RTCConfiguration
-import av # สำหรับจัดการ frame วิดีโอ
+import av
 
-# --- 1. SETTINGS & THEME ---
+# --- 1. การตั้งค่าหน้าเว็บ (UI/UX Design) ---
 st.set_page_config(
     page_title="SafetyAI | Construction Monitor",
     page_icon="👷",
     layout="wide"
 )
 
+# Custom CSS สำหรับโหมด Premium (High-Contrast)
 st.markdown("""
     <style>
-    [data-testid="stHeader"] {background: rgba(0,0,0,0);}
-    .main { background-color: #0e1117; }
+    .main { background-color: #0e1117; color: white; }
     .stMetric { 
         background-color: #1f2937; 
-        padding: 20px; 
+        padding: 15px; 
         border-radius: 12px; 
         border-bottom: 4px solid #FFD700;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
+    div[data-testid="stExpander"] { border: none; background: #1f2937; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. LOAD MODEL (Cached) ---
+# --- 2. การโหลดโมเดล (Cached) ---
 @st.cache_resource
 def load_yolo_model():
     try:
-        # มั่นใจว่าไฟล์ best.pt อยู่ในโฟลเดอร์เดียวกับ app.py บน GitHub
+        # ใช้ไฟล์ best.pt ที่คุณเทรนเสร็จวางไว้ในโฟลเดอร์เดียวกัน
         model = YOLO('best.pt') 
         return model
     except Exception as e:
-        st.error(f"ไม่สามารถโหลดโมเดลได้: {e}")
+        st.error(f"Error loading model: {e}")
         return None
 
 model = load_yolo_model()
 
-# --- 3. RTC CONFIGURATION (สำหรับข้าม Firewall บน Cloud) ---
+# --- 3. การตั้งค่าระบบวิดีโอ (WebRTC & STUN) ---
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# --- 4. VIDEO PROCESSING CLASS ---
+# --- 4. หัวใจหลัก: ส่วนประมวลผลวิดีโอ (AI Logic) ---
 class VideoProcessor(VideoTransformerBase):
     def __init__(self):
         self.conf_threshold = 0.5
+        # เก็บจำนวนที่ตรวจเจอ (สำหรับแสดงผลที่ Sidebar/Dashboard)
+        self.results_data = {"Worker": 0, "Helmet": 0, "Vest": 0, "Gloves": 0, "Boots": 0}
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
 
         if model is not None:
-            # รันการตรวจจับ
-            results = model.predict(img, conf=self.conf_threshold, verbose=False)
-            # วาดกรอบ Bounding Box ลงบนภาพ
+            # รัน YOLO (ลดขนาด imgsz เพื่อเพิ่ม FPS บน Cloud)
+            results = model.predict(img, conf=self.conf_threshold, verbose=False, imgsz=480)
             annotated_img = results[0].plot()
             
-            # (Optional) ตรงนี้คือจุดที่คุณสามารถใส่ Logic แจ้งเตือนได้ในอนาคต
+            # นับจำนวน Class ที่เจอในเฟรมปัจจุบัน
+            temp_counts = {"Worker": 0, "Helmet": 0, "Vest": 0, "Gloves": 0, "Boots": 0}
+            for box in results[0].boxes:
+                class_id = int(box.cls[0])
+                label = model.names[class_id]
+                if label in temp_counts:
+                    temp_counts[label] += 1
+            
+            self.results_data = temp_counts
         else:
             annotated_img = img
 
         return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
 
-# --- 5. SIDEBAR ---
+# --- 5. การจัดวางหน้าจอ (Layout) ---
+st.title("👷 AI-Powered Construction Safety Monitoring")
+
+# Sidebar สำหรับควบคุม
 with st.sidebar:
-    st.title("🚧 Safety Control")
+    st.header("⚙️ Control Panel")
+    app_mode = st.radio("เลือกหน้าจอ", ["Live Monitoring", "System Dashboard"])
     st.write("---")
-    app_mode = st.radio("เลือกโหมดการทำงาน", ["Dashboard", "Live Monitoring"])
-    st.write("---")
-    conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.5)
-    st.info("Status: System Ready")
+    conf_threshold = st.slider("ความแม่นยำ (Confidence)", 0.0, 1.0, 0.5)
+    facing_mode = st.selectbox("เลือกกล้อง (สำหรับมือถือ)", ["environment", "user"], index=0)
+    st.info("Status: System Running")
 
-# --- 6. MAIN PAGE LOGIC ---
-if app_mode == "Dashboard":
-    st.title("👷 Construction Safety Dashboard")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Workers", "Checking...", "Live")
-    m2.metric("Compliance", "90%", "Target: 100%")
-    m3.metric("Alerts Today", "0", "Good")
-    m4.metric("System", "Online")
-
-elif app_mode == "Live Monitoring":
-    st.title("📽️ Real-time Detection (WebRTC)")
-    
+if app_mode == "Live Monitoring":
     col_vid, col_stat = st.columns([7, 3])
     
     with col_vid:
-        st.markdown("#### Camera Feed")
-        # ส่วนเรียกใช้งานกล้องผ่าน WebRTC
+        st.subheader("📽️ Live Feed")
         ctx = webrtc_streamer(
-            key="ppe-detection",
+            key="ppe-check",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIGURATION,
             video_processor_factory=VideoProcessor,
-            media_stream_constraints={"video": True, "audio": False},
+            media_stream_constraints={
+                "video": {"facingMode": facing_mode},
+                "audio": False
+            },
             async_processing=True,
         )
-        
-        # ส่งค่า Confidence จาก Slider เข้าไปใน Processor
-        if ctx.video_processor:
-            ctx.video_processor.conf_threshold = conf_threshold
 
     with col_stat:
-        st.markdown("#### Analysis Details")
-        if ctx.state.playing:
-            st.success("กล้องกำลังทำงาน...")
+        st.subheader("📊 Real-time Stats")
+        if ctx.video_processor:
+            # ดึงข้อมูลจาก Processor มาแสดงผลข้างวิดีโอ
+            data = ctx.video_processor.results_data
+            ctx.video_processor.conf_threshold = conf_threshold
+            
+            st.metric("Workers Detected", data["Worker"])
+            st.metric("Safety Helmets", data["Helmet"])
+            st.metric("Safety Vests", data["Vest"])
+            
+            # Logic แจ้งเตือนพื้นฐาน
+            if data["Worker"] > data["Helmet"]:
+                st.error(f"🚨 ALERT: พบคนงาน {data['Worker'] - data['Helmet']} คน ไม่ใส่หมวก!")
+            if data["Worker"] > data["Vest"]:
+                st.warning(f"⚠️ Warning: พบคนงาน {data['Worker'] - data['Vest']} คน ไม่ใส่เสื้อกั๊ก")
         else:
-            st.warning("กด START ด้านซ้ายเพื่อเริ่มกล้อง")
+            st.write("กรุณากด START เพื่อเริ่มระบบตรวจจับ")
+
+elif app_mode == "System Dashboard":
+    st.subheader("📈 Safety Analytics Summary")
+    # ส่วนนี้สามารถดึงฐานข้อมูลมาแสดงเป็นกราฟในอนาคต
+    st.info("ส่วนแสดงสถิติภาพรวมความปลอดภัยรายวัน")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Compliance Rate", "85%", "+5%")
+    c2.metric("Total Incidents", "2", "-1")
+    c3.metric("Inspected Workers", "124", "Today")
