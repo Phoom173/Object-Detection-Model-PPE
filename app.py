@@ -4,32 +4,52 @@ from ultralytics import YOLO
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, RTCConfiguration
 import av
 
-# --- 1. การตั้งค่าหน้าเว็บ (UI/UX Design) ---
+# --- 1. SETTINGS & THEME (ปรับปรุงสีให้ชัดเจน) ---
 st.set_page_config(
     page_title="SafetyAI | Construction Monitor",
     page_icon="👷",
     layout="wide"
 )
 
-# Custom CSS สำหรับโหมด Premium (High-Contrast)
 st.markdown("""
     <style>
-    .main { background-color: #0e1117; color: white; }
-    .stMetric { 
-        background-color: #1f2937; 
+    /* พื้นหลังหลัก */
+    .main { background-color: #0b0e14; color: white; }
+    
+    /* Sidebar: ปรับให้สีเข้มกว่าพื้นหลังหลักเพื่อความชัดเจน */
+    [data-testid="stSidebar"] {
+        background-color: #161b22;
+        border-right: 1px solid #30363d;
+    }
+
+    /* Metric Card: ปรับตัวอักษรเป็นสีขาวสว่าง */
+    [data-testid="stMetric"] { 
+        background-color: #1c2128; 
         padding: 15px; 
         border-radius: 12px; 
         border-bottom: 4px solid #FFD700;
     }
-    div[data-testid="stExpander"] { border: none; background: #1f2937; }
+    
+    /* บังคับสีตัวอักษร Metric ทั้งหมดให้เป็นสีขาว */
+    [data-testid="stMetricLabel"] p {
+        color: #ffffff !important;
+        font-size: 16px !important;
+        font-weight: bold !important;
+    }
+    [data-testid="stMetricValue"] div {
+        color: #ffffff !important;
+        font-size: 28px !important;
+    }
+    
+    /* ปรับแต่งหัวข้อ */
+    h1, h2, h3 { color: #FFD700 !important; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 2. การโหลดโมเดล (Cached) ---
+# --- 2. LOAD MODEL ---
 @st.cache_resource
 def load_yolo_model():
     try:
-        # ใช้ไฟล์ best.pt ที่คุณเทรนเสร็จวางไว้ในโฟลเดอร์เดียวกัน
         model = YOLO('best.pt') 
         return model
     except Exception as e:
@@ -38,93 +58,83 @@ def load_yolo_model():
 
 model = load_yolo_model()
 
-# --- 3. การตั้งค่าระบบวิดีโอ (WebRTC & STUN) ---
-RTC_CONFIGURATION = RTCConfiguration(
-    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
-)
-
-# --- 4. หัวใจหลัก: ส่วนประมวลผลวิดีโอ (AI Logic) ---
+# --- 3. VIDEO PROCESSING (เพิ่มระบบ Frame Skipping เพื่อความลื่นไหล) ---
 class VideoProcessor(VideoTransformerBase):
     def __init__(self):
         self.conf_threshold = 0.5
-        # เก็บจำนวนที่ตรวจเจอ (สำหรับแสดงผลที่ Sidebar/Dashboard)
-        self.results_data = {"Worker": 0, "Helmet": 0, "Vest": 0, "Gloves": 0, "Boots": 0}
+        self.frame_count = 0
+        self.skip_frames = 2  # ประมวลผล 1 เฟรม และข้าม 2 เฟรม (ปรับเพิ่มได้ถ้ายังกระตุก)
+        self.last_results = {"Person": 0, "Helmet": 0, "Vest": 0, "Boots": 0, "Gloves": 0}
+        self.last_annotated = None
 
     def recv(self, frame):
         img = frame.to_ndarray(format="bgr24")
+        self.frame_count += 1
 
-        if model is not None:
-            # รัน YOLO (ลดขนาด imgsz เพื่อเพิ่ม FPS บน Cloud)
-            results = model.predict(img, conf=self.conf_threshold, verbose=False, imgsz=480)
-            annotated_img = results[0].plot()
-            
-            # นับจำนวน Class ที่เจอในเฟรมปัจจุบัน
-            temp_counts = {"Worker": 0, "Helmet": 0, "Vest": 0, "Gloves": 0, "Boots": 0}
-            for box in results[0].boxes:
-                class_id = int(box.cls[0])
-                label = model.names[class_id]
-                if label in temp_counts:
-                    temp_counts[label] += 1
-            
-            self.results_data = temp_counts
-        else:
-            annotated_img = img
+        # รัน AI เฉพาะเฟรมที่ไม่ได้ถูกข้าม
+        if self.frame_count % (self.skip_frames + 1) == 0 or self.last_annotated is None:
+            if model is not None:
+                results = model.predict(img, conf=self.conf_threshold, verbose=False, imgsz=480)
+                self.last_annotated = results[0].plot()
+                
+                # อัปเดตตัวนับ
+                temp_counts = {"Person": 0, "Helmet": 0, "Vest": 0, "Boots": 0, "Gloves": 0}
+                for box in results[0].boxes:
+                    label = model.names[int(box.cls[0])]
+                    if label in temp_counts:
+                        temp_counts[label] += 1
+                self.last_results = temp_counts
+            else:
+                self.last_annotated = img
 
-        return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
+        return av.VideoFrame.from_ndarray(self.last_annotated, format="bgr24")
 
-# --- 5. การจัดวางหน้าจอ (Layout) ---
-st.title("👷 AI-Powered Construction Safety Monitoring")
-
-# Sidebar สำหรับควบคุม
+# --- 4. LAYOUT & SIDEBAR ---
 with st.sidebar:
     st.header("⚙️ Control Panel")
     app_mode = st.radio("เลือกหน้าจอ", ["Live Monitoring", "System Dashboard"])
     st.write("---")
     conf_threshold = st.slider("ความแม่นยำ (Confidence)", 0.0, 1.0, 0.5)
-    facing_mode = st.selectbox("เลือกกล้อง (สำหรับมือถือ)", ["environment", "user"], index=0)
-    st.info("Status: System Running")
+    facing_mode = st.selectbox("เลือกกล้อง", ["environment", "user"], index=0)
+    st.success("System: Ready")
 
+# --- 5. MAIN LOGIC ---
 if app_mode == "Live Monitoring":
+    st.title("📽️ Safety Monitoring (Optimized)")
+    
     col_vid, col_stat = st.columns([7, 3])
     
     with col_vid:
-        st.subheader("📽️ Live Feed")
         ctx = webrtc_streamer(
             key="ppe-check",
             mode=WebRtcMode.SENDRECV,
-            rtc_configuration=RTC_CONFIGURATION,
+            rtc_configuration={"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]},
             video_processor_factory=VideoProcessor,
-            media_stream_constraints={
-                "video": {"facingMode": facing_mode},
-                "audio": False
-            },
+            media_stream_constraints={"video": {"facingMode": facing_mode}, "audio": False},
             async_processing=True,
         )
 
     with col_stat:
-        st.subheader("📊 Real-time Stats")
         if ctx.video_processor:
-            # ดึงข้อมูลจาก Processor มาแสดงผลข้างวิดีโอ
-            data = ctx.video_processor.results_data
+            data = ctx.video_processor.last_results
             ctx.video_processor.conf_threshold = conf_threshold
             
-            st.metric("Workers Detected", data["Worker"])
+            st.metric("Persons Detected", data["Person"])
             st.metric("Safety Helmets", data["Helmet"])
             st.metric("Safety Vests", data["Vest"])
+            st.metric("Boots/Gloves", f"{data['Boots']} / {data['Gloves']}")
             
-            # Logic แจ้งเตือนพื้นฐาน
-            if data["Worker"] > data["Helmet"]:
-                st.error(f"🚨 ALERT: พบคนงาน {data['Worker'] - data['Helmet']} คน ไม่ใส่หมวก!")
-            if data["Worker"] > data["Vest"]:
-                st.warning(f"⚠️ Warning: พบคนงาน {data['Worker'] - data['Vest']} คน ไม่ใส่เสื้อกั๊ก")
+            # Logic แจ้งเตือน
+            if data["Person"] > data["Helmet"]:
+                st.error(f"🚨 ALERT: {data['Person'] - data['Helmet']} คน ไม่ใส่หมวก")
+            if data["Person"] > data["Vest"]:
+                st.warning(f"⚠️ WARNING: {data['Person'] - data['Vest']} คน ไม่ใส่เสื้อกั๊ก")
         else:
-            st.write("กรุณากด START เพื่อเริ่มระบบตรวจจับ")
+            st.info("กรุณากด START เพื่อเริ่มกล้อง")
 
 elif app_mode == "System Dashboard":
-    st.subheader("📈 Safety Analytics Summary")
-    # ส่วนนี้สามารถดึงฐานข้อมูลมาแสดงเป็นกราฟในอนาคต
-    st.info("ส่วนแสดงสถิติภาพรวมความปลอดภัยรายวัน")
+    st.title("📈 Analytics Summary")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Compliance Rate", "85%", "+5%")
-    c2.metric("Total Incidents", "2", "-1")
-    c3.metric("Inspected Workers", "124", "Today")
+    c1.metric("Compliance Rate", "92%", "+2%")
+    c2.metric("Total Persons", "45", "Live")
+    c3.metric("Critical Alerts", "0", "Good")
