@@ -1,8 +1,8 @@
 import streamlit as st
-import cv2
 import numpy as np
 from ultralytics import YOLO
-import time
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode, RTCConfiguration
+import av # สำหรับจัดการ frame วิดีโอ
 
 # --- 1. SETTINGS & THEME ---
 st.set_page_config(
@@ -11,7 +11,6 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS เพื่อความ Premium และ High-Contrast
 st.markdown("""
     <style>
     [data-testid="stHeader"] {background: rgba(0,0,0,0);}
@@ -23,100 +22,89 @@ st.markdown("""
         border-bottom: 4px solid #FFD700;
         box-shadow: 0 4px 6px rgba(0,0,0,0.3);
     }
-    .status-box {
-        padding: 10px;
-        border-radius: 5px;
-        margin-bottom: 10px;
-    }
     </style>
     """, unsafe_allow_html=True)
 
 # --- 2. LOAD MODEL (Cached) ---
 @st.cache_resource
 def load_yolo_model():
-    # เปลี่ยนเป็น path ของไฟล์ที่คุณเทรนเสร็จ เช่น 'runs/detect/train/weights/best.pt'
     try:
+        # มั่นใจว่าไฟล์ best.pt อยู่ในโฟลเดอร์เดียวกับ app.py บน GitHub
         model = YOLO('best.pt') 
         return model
-    except:
+    except Exception as e:
+        st.error(f"ไม่สามารถโหลดโมเดลได้: {e}")
         return None
 
 model = load_yolo_model()
 
-# --- 3. SIDEBAR NAVIGATION ---
+# --- 3. RTC CONFIGURATION (สำหรับข้าม Firewall บน Cloud) ---
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
+)
+
+# --- 4. VIDEO PROCESSING CLASS ---
+class VideoProcessor(VideoTransformerBase):
+    def __init__(self):
+        self.conf_threshold = 0.5
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+
+        if model is not None:
+            # รันการตรวจจับ
+            results = model.predict(img, conf=self.conf_threshold, verbose=False)
+            # วาดกรอบ Bounding Box ลงบนภาพ
+            annotated_img = results[0].plot()
+            
+            # (Optional) ตรงนี้คือจุดที่คุณสามารถใส่ Logic แจ้งเตือนได้ในอนาคต
+        else:
+            annotated_img = img
+
+        return av.VideoFrame.from_ndarray(annotated_img, format="bgr24")
+
+# --- 5. SIDEBAR ---
 with st.sidebar:
     st.title("🚧 Safety Control")
     st.write("---")
-    app_mode = st.radio("เลือกโหมดการทำงาน", ["Dashboard", "Live Monitoring", "Reports"])
+    app_mode = st.radio("เลือกโหมดการทำงาน", ["Dashboard", "Live Monitoring"])
     st.write("---")
     conf_threshold = st.slider("Confidence Threshold", 0.0, 1.0, 0.5)
-    st.success("System: Active")
+    st.info("Status: System Ready")
 
-# --- 4. MAIN PAGE LOGIC ---
+# --- 6. MAIN PAGE LOGIC ---
 if app_mode == "Dashboard":
     st.title("👷 Construction Safety Dashboard")
-    
-    # ส่วนสรุปตัวเลขด้านบน
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Workers", "15", "2 new")
-    m2.metric("PPE Compliance", "94%", "High")
-    m3.metric("Critical Alerts", "1", "-10%", delta_color="inverse")
-    m4.metric("Active Cameras", "1", "Online")
-
-    # ส่วนกราฟหรือข้อมูลจำลอง (คุณสามารถเพิ่ม Plotly ต่อได้ที่นี่)
-    st.info("ยินดีต้อนรับสู่ระบบตรวจสอบความปลอดภัย โปรดเลือกโหมด Live Monitoring เพื่อเริ่มตรวจจับ")
+    m1.metric("Workers", "Checking...", "Live")
+    m2.metric("Compliance", "90%", "Target: 100%")
+    m3.metric("Alerts Today", "0", "Good")
+    m4.metric("System", "Online")
 
 elif app_mode == "Live Monitoring":
-    st.title("📽️ Real-time Detection")
+    st.title("📽️ Real-time Detection (WebRTC)")
     
     col_vid, col_stat = st.columns([7, 3])
     
     with col_vid:
         st.markdown("#### Camera Feed")
-        # สร้าง placeholder สำหรับวิดีโอ
-        frame_window = st.image([], width="stretch")
+        # ส่วนเรียกใช้งานกล้องผ่าน WebRTC
+        ctx = webrtc_streamer(
+            key="ppe-detection",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_processor_factory=VideoProcessor,
+            media_stream_constraints={"video": True, "audio": False},
+            async_processing=True,
+        )
         
-        # ปุ่มเริ่ม/หยุด
-        run_camera = st.checkbox('เปิดกล้อง (Start Camera)', value=False)
-        
+        # ส่งค่า Confidence จาก Slider เข้าไปใน Processor
+        if ctx.video_processor:
+            ctx.video_processor.conf_threshold = conf_threshold
+
     with col_stat:
         st.markdown("#### Analysis Details")
-        alert_placeholder = st.empty()
-        st.write("---")
-        log_placeholder = st.empty()
-
-    # --- DETECTION LOOP ---
-    if run_camera:
-        # 0 คือกล้อง Webcam, หรือใส่ URL ของกล้อง IP ก็ได้
-        cap = cv2.VideoCapture(0) 
-        
-        while cap.isOpened() and run_camera:
-            ret, frame = cap.read()
-            if not ret:
-                st.error("ไม่สามารถเชื่อมต่อกล้องได้")
-                break
-
-            # 1. รัน YOLO Detection
-            if model:
-                results = model.predict(frame, conf=conf_threshold)
-                annotated_frame = results[0].plot() # วาด Bounding Box
-                
-                # 2. แสดงผลใน Streamlit
-                frame_window.image(annotated_frame, channels="BGR", width="stretch")
-                
-                # 3. Logic ตรวจสอบ PPE (ตัวอย่าง)
-                # เราจะแกะผลลัพธ์จาก results[0].boxes เพื่อเช็คว่าใครไม่ใส่หมวกบ้าง
-                # alert_placeholder.error("🚨 ALERT: Worker detected without Helmet!")
-            else:
-                st.warning("กำลังรอไฟล์โมเดล best.pt...")
-                frame_window.image(frame, channels="BGR", width="stretch")
-
-            # หน่วงเวลาเล็กน้อยเพื่อให้ระบบไม่ทำงานหนักเกินไป
-            time.sleep(0.01)
-        
-        cap.release()
-
-elif app_mode == "Reports":
-    st.title("📋 Safety Incident Reports")
-    st.write("ส่วนนี้สำหรับดาวน์โหลดข้อมูลย้อนหลัง")
-    st.button("Download CSV Report")
+        if ctx.state.playing:
+            st.success("กล้องกำลังทำงาน...")
+        else:
+            st.warning("กด START ด้านซ้ายเพื่อเริ่มกล้อง")
